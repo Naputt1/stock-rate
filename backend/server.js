@@ -1,20 +1,14 @@
 const express = require("express");
-const axios = require("axios");
 const socket = require("socket.io");
-const fs = require("fs");
+const cors = require("cors");
+const http = require("http");
 const puppeteer = require("puppeteer");
-const { rejects } = require("assert");
-const Mutex = require("async-mutex").Mutex;
 
-
-
-const PORT = 3000;
-const t = 'https://www.settrade.com/api/set/stock/list'
-const ti = 'https://www.settrade.com/api/set-fund/fund/active-fund/list'
-const t3 = 'https://www.settrade.com/api/set/tfex/series/list'
-const t4 = 'https://www.settrade.com/api/set-fund/fund/virtualport/list'
-const a = 'https://www.settrade.com/api/set/ranking/topGainer/set/S?count=20'
+const PORT = 3001;
 const AXIOS_URL = "https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js";
+// max 50
+const TOTOAL_STOCK_COUNT = 10;
+const FRINTEND_URL = 'http://localhost:3000';
 
 const state = {
   gettingData1: false,
@@ -23,54 +17,21 @@ const state = {
   data1 : [],
   data2: {},
   fullData : [],
-  mutex: new Mutex(),
 };
 
 let browser;
 let page1;
 let page2;
 
-async function wait(func) {
-  if (func()) {
-    return;
-  }
-
-  return new Promise((resolve) => {
-        setTimeout(() => {
-          console.log("timeout", func())
-          if (func()) {
-            console.log("resolve")
-            resolve();
-          }
-        }, 10);
-      })
-}
-
-let getFullData;
-
-let bAxios1 = false;
-let bAxios2 = false;
-async function main() {
-  browser = await puppeteer.launch({ headless: false });
-  page1 = await browser.newPage();
-  page2 = await browser.newPage();
-
-  await page1.goto(
-    "https://www.settrade.com/th/equities/market-summary/top-ranking/top-gainer",
-    {
-      waitUntil: "load",
-    }
-  );
-
-  await page2.goto(
-    "https://www.set.or.th/en/market/product/stock/quote/NATION-F/price",
-    {
-      waitUntil: "load",
-    }
-  );
-
-  if (!bAxios1) {
-    await await page1.evaluate(async (AXIOS_URL) => {
+async function gotoPage(page, url) {
+  return new Promise(async (resolve, reject) => {
+    await page.goto(
+      url,
+      {
+        waitUntil: "load",
+      }
+    );
+    await await page.evaluate(async (AXIOS_URL) => {
       return new Promise((resolve, reject) => {
         const script = document.createElement("script");
         script.src = AXIOS_URL;
@@ -86,36 +47,60 @@ async function main() {
         document.head.appendChild(script);
       });
     }, AXIOS_URL);
-    bAxios1 = true;
+
+    resolve();
+  })
+}
+
+let getFullData;
+
+const app = express();
+app.use(cors({ origin: FRINTEND_URL }));
+const server = http.createServer(app);
+const io = socket(server, {
+  cors: {
+    origin: "http://localhost:3000",
+  },
+});
+server.listen(PORT);
+
+app.get("/", async (req, res) => {
+  if (state.updated) {
+    await getFullData();
   }
 
-  if (!bAxios2) {
-    await await page2.evaluate(async (AXIOS_URL) => {
-      return new Promise((resolve) => {
-        const script = document.createElement("script");
-        script.src = AXIOS_URL;
+  res.send(state.fullData);
+});
 
-        script.onload = () => {
-          resolve();
-        };
+async function emitUpdate() {
+  await getFullData();
 
-        script.onerror = () => {
-          throw new Error("error loading axios in page 2");
-        };
+  io.emit('update', state.fullData);
+}
 
-        document.head.appendChild(script);
-      });
-    }, AXIOS_URL);
-    bAxios2 = true;
-  }
+
+async function main() {
+  browser = await puppeteer.launch();
+  page1 = await browser.newPage();
+  page2 = await browser.newPage();
+
+  await Promise.all([
+    gotoPage(
+      page1,
+      "https://www.settrade.com/th/equities/market-summary/top-ranking/top-gainer"
+    ),
+    gotoPage(
+      page2,
+      "https://www.set.or.th/en/market/product/stock/quote/NATION-F/price"
+    ),
+  ]);
 
   async function getData1() {
-
     state.gettingData1 = true;
-    const data = await page1.evaluate(async () => {
+    const data = await page1.evaluate(async (TOTOAL_STOCK_COUNT) => {
       return await axios
         .get(
-          "https://www.settrade.com/api/set/ranking/topGainer/set/S?count=20"
+          `https://www.settrade.com/api/set/ranking/topGainer/set/S?count=${TOTOAL_STOCK_COUNT}`
         )
         .then((response) => {
           console.log("get", response.data.length);
@@ -124,37 +109,21 @@ async function main() {
         .catch((err) => {
           console.error(err.response);
         });
-    });
+    }, TOTOAL_STOCK_COUNT);
 
     state.data1 = data.stocks;
     state.updated = true;
     state.gettingData1 = false;
-    console.log("data1", state.data1.length);
+
+    emitUpdate();
   }
 
   async function getData2(toReturn) {
-
     state.gettingData2 = true;
-    // if (state.gettingData1) {
-    //   console.log("data2 :wait fetch data 1")
-    //   try {
-    //     await wait(() => !state.gettingData1);
-    //   } catch (err) {
-    //     console.log("dead lock");
-    //     state.gettingData2 = false;
-    //     return;
-    //   }
-    //   console.log("data1 :finish wait fetch data 1");
-
-    // }
 
     let toFetch;
     if (toReturn == null) {
-      await wait(() => state.data1.length !== 0)
-
       toFetch = [];
-      // console.log(state);
-
       for (const stock of state.data1) {
         toFetch.push(stock.symbol);
       }
@@ -162,11 +131,9 @@ async function main() {
       toFetch = toReturn;
     }
 
-    console.log('toFetch', toFetch)
     const data = await page2.evaluate(async (toFetch) => {
       const data = [];
       for (const symbol of toFetch) {
-        console.log(toFetch);
         data.push(
           await axios
             .get(
@@ -186,7 +153,6 @@ async function main() {
 
     if (toReturn == null) {
       for (const d of data) {
-        // console.log(data);
         state.data2[d.symbol.toUpperCase()] = d.marketCapd;
       }
       state.data2 = data;
@@ -197,6 +163,8 @@ async function main() {
       state.gettingData2 = false;
       return data;
     }
+
+    emitUpdate();
   }
 
   getFullData = async ()=> {
@@ -205,6 +173,7 @@ async function main() {
     for (const stock of state.data1) {
       const temp = {
         symbol: stock.symbol,
+        last: stock.last,
         change: stock.change,
         percentChange: stock.percentChange,
       };
@@ -217,7 +186,6 @@ async function main() {
       fullData.push(temp);
     }
 
-    console.log('get full data', toFetch)
     if (toFetch.length > 0) {
       const marketCap = await getData2(toFetch);
       for (const marketCapStock of marketCap) {
@@ -230,7 +198,6 @@ async function main() {
       }
     }
 
-    console.log("full data");
     state.fullData = fullData;
     state.updated = false;
   }
@@ -249,17 +216,3 @@ async function main() {
 }
 
 main();
-
-const app = express();
-
-app.get("/", async (req, res) => {
-  if (state.updated) {
-    await getFullData();
-  }
-  
-  res.send(state.fullData);
-});
-
-app.listen(PORT, () => {
-  console.log(`Example app listening on port ${PORT}`);
-});
